@@ -28,6 +28,8 @@ ap.add_argument("-d", "--display", help="Draw each frame on the display",
     action="store_true")
 ap.add_argument("-a", "--address", help="Connection string aka target address of vehicle to connect to. Default /dev/ttyAMA0",
     default="/dev/ttyAMA0")
+ap.add_argument("-i", "--imgonly", help="Only process images, don't try to connect to quadcopter.",
+    action="store_true")
 args = ap.parse_args()
 
 # setup video input
@@ -45,27 +47,28 @@ else: # otherwise, grab a reference to the video file
     print("Using video file")
 
 # set up dronekit
-if args.sitl:
-    sitl = dronekit_sitl.start_default()
-    connectionString = sitl.connection_string()
-    print("SITL running on %s" % connectionString)
-    vehicle = connect(connectionString)
-    vehicle.wait_ready(True, timeout=30) # wait until available vehicle parameters have been collected
-else: # connect to drone
-    vehicle = connect(args.address, wait_ready=True, baud=57600)
-# set up updates for attitude
-def attitudeCallback(self, attrName, value):
-    print(vehicle.attitude)
-vehicle.add_attribute_listener('attitude', attitudeCallback)
-    
-# print vehicle info
-print("Some vehicle attribute values:")
-print(" GPS: %s" % vehicle.gps_0)
-print(" Battery: %s" % vehicle.battery)
-print(" Last Heartbeat: %s" % vehicle.last_heartbeat)
-print(" Is Armable?: %s" % vehicle.is_armable)
-print(" System status: %s" % vehicle.system_status.state)
-print(" Mode: %s" % vehicle.mode.name) # settable
+if args.imgonly == None:
+    if args.sitl:
+        sitl = dronekit_sitl.start_default()
+        connectionString = sitl.connection_string()
+        print("SITL running on %s" % connectionString)
+        vehicle = connect(connectionString)
+        vehicle.wait_ready(True, timeout=30) # wait until available vehicle parameters have been collected
+    else: # connect to drone
+        vehicle = connect(args.address, wait_ready=True, baud=57600)
+    # set up updates for attitude
+    def attitudeCallback(self, attrName, value):
+        print(vehicle.attitude)
+    vehicle.add_attribute_listener('attitude', attitudeCallback)
+        
+    # print vehicle info
+    print("Some vehicle attribute values:")
+    print(" GPS: %s" % vehicle.gps_0)
+    print(" Battery: %s" % vehicle.battery)
+    print(" Last Heartbeat: %s" % vehicle.last_heartbeat)
+    print(" Is Armable?: %s" % vehicle.is_armable)
+    print(" System status: %s" % vehicle.system_status.state)
+    print(" Mode: %s" % vehicle.mode.name) # settable
 
 # main loop
 while True:
