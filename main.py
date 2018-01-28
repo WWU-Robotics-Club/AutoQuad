@@ -47,8 +47,8 @@ else: # otherwise, grab a reference to the video file
     print("Using video file")
 
 # set up dronekit
-if args.imgonly == None:
-    if args.sitl:
+if args.imgonly == False:
+    if args.sitl == True:
         sitl = dronekit_sitl.start_default()
         connectionString = sitl.connection_string()
         print("SITL running on %s" % connectionString)
