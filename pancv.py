@@ -4,6 +4,7 @@ import numpy as np
 import imutils
 import cv2
 import math
+import time
 
 class Point:
     imgPoint = None # (x,y) position of moment of detected shape
@@ -12,10 +13,12 @@ class Point:
     radians = None # width of target in radians
     distance = None # triangulated distance from camera
     children = None # number of contours found within outer contour
-    #time = None
+    time = None # time point was processed
     angleX = None # radians from center of image
     angleY = None
     confidence = None # 0 to 1
+    def age(self):
+        return time.time() - self.time
 class PanCV:
     camera = None
 
@@ -32,15 +35,40 @@ class PanCV:
     points = deque(maxlen=historySize)
     lastFrame = None
     lastMask = None
+    idealRadius = 50 # used when scaling
+    # private
+    _hResScaled = None
+    _vResScaled = None
+    _resScalar = None # scale resolution. Use lower when closer to get higher framerate
+    def scaleRes(self, scale, add = False):
+        if add:
+            scale = scale + self._resScalar
+        if scale > 1:
+            scale = 1
+        elif scale < 0.1:
+            scale = 0.1
+        self._resScalar = scale
+        self._hResScaled = int(self.horizontalRes*scale)
+        self._vResScaled = int(self.verticalRes*scale)
+    # returns index of last 1 confidence point. -1 if none have 1 confidence
+    def lastGoodPoint(self, threshold):
+        i = 0
+        lq = len(self.points)
+        while i < lq and self.points[i].confidence < threshold:
+            i += 1
+        if self.points[i].confidence == 1:
+            return i
+        else:
+            return -1
     def resetHistorySize(self, size):
         self.historySize = size
         self.points = deque(maxlen = size)
     def detect(self, frame):
         currentPoint = Point()
-     
+        currentPoint.time = time.time()
         # resize the frame, blur it, and convert it to the HSV
         # color space
-        frame = imutils.resize(frame, width=self.horizontalRes)
+        frame = imutils.resize(frame, width=self._hResScaled)
         # blurred = cv2.GaussianBlur(frame, (11, 11), 0)
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
@@ -51,8 +79,8 @@ class PanCV:
         mask2 = cv2.inRange(hsv, self.colorLower2, self.colorUpper2)
         mask = mask1 + mask2
         
-        mask = cv2.erode(mask, None, iterations=1)
-        mask = cv2.dilate(mask, None, iterations=1)
+        #mask = cv2.erode(mask, None, iterations=1)
+        #mask = cv2.dilate(mask, None, iterations=1)
 
         # find contours in the mask and initialize the current
         # (x, y) center of the ball
@@ -64,9 +92,16 @@ class PanCV:
             cv2.putText(frame, "Dist: " + str(currentPoint.distance)[:5], (5,15), 1, 1.0, (0,200,200), 1)
             cv2.putText(frame, "Children: " + str(currentPoint.children)[:5], (5,30), 1, 1.0, (0,200,200), 1)
             cv2.putText(frame, "Confidence: " + str(currentPoint.confidence)[:5], (5,45), 1, 1.0, (0,200,200), 1)
+            cv2.putText(frame, "Pix radius: " + str(currentPoint.radius)[:5], (5,60), 1, 1.0, (0,200,200), 1)
+
+        # change scale
+        if currentPoint.confidence == 1:
+            self.scaleRes(self._resScalar * self.idealRadius / currentPoint.radius)
+        else: # increase scale slightly to hopefully get better result
+            self.scaleRes(0.02, True)
         # update the points queue
         self.points.appendleft(currentPoint)
-
+        
         self.lastFrame = frame
         self.lastMask = mask
         return
@@ -120,12 +155,12 @@ class PanCV:
         # See Point class. Given self.cameraFOV, self.frameWidth,
         # x pixels (point.imgPoint[0]), y pixels (point.imgPoint[1]) and radius (point.radius),
         # populate point's x, y, and z with distance from target
-        radPerPix = np.deg2rad(self.cameraFOV) / self.horizontalRes
+        radPerPix = np.deg2rad(self.cameraFOV) / self._hResScaled
         halfTargetAngle = point.radius * radPerPix
         point.radians = 2 * halfTargetAngle
         point.distance = self.targetRadius / math.tan(halfTargetAngle)
-        point.angleX = (point.imgCentroid[0] - self.horizontalRes/2) * radPerPix
-        point.angleX = (point.imgCentroid[1] - self.verticalRes/2) * radPerPix
+        point.angleX = (point.imgCentroid[0] - self._hResScaled/2) * radPerPix
+        point.angleY = (point.imgCentroid[1] - self._vResScaled/2) * radPerPix
         return
     def display(self):
         # loop over the set of tracked points
