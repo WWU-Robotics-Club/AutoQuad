@@ -109,7 +109,7 @@ def initDronekit():
     else:
         connectionString = config.get(configSection,'address')
     try: # connect to drone
-        vehicle = dronekit.connect(connectionString, wait_ready=True, baud=57600)
+        vehicle = dronekit.connect(connectionString, wait_ready=True, baud=config.getfloat(configSection,'baud'))
     # Bad TCP connection
     except socket.error:
         print 'Dronekit exception: No server exists!'
@@ -152,17 +152,24 @@ def takeoff():
     global homeLocal
     global modeStartTime
     global flightStartTime
-    printb("Waiting for vehicle armable")
+    printb("Waiting for vehicle armable.")
     while not vehicle.is_armable:
         time.sleep(1)
     printb("Vehicle is armable.")
     
     # fly vehicle
+    printb("Waiting for start signal. Current level: ")
     while vehicle.channels[START_CH_NUM] < 1700 and not USE_SITL:
-        printb("Waiting for start signal. Current level: "
-            + str(vehicle.channels[START_CH_NUM]))
-        time.sleep(1.5)
+        sys.stdout.write(str(vehicle.channels[START_CH_NUM]) + '\r')
+        sys.stdout.flush()
+        time.sleep(1)
     printb("Received start signal")
+    printb("Waiting for gps fix. Current fix type, satelites: ")
+    while vehicle.gps_0.fix_type != 3:
+        sys.stdout.write(str(vehicle.gps_0.fix_type) + ","
+            + str(vehicle.gps_0.satellites_visible) + '\r')
+        sys.stdout.flush()
+        time.sleep(1)
     printb("Changing mode to guided")
     vehicle.mode = dronekit.VehicleMode("GUIDED")
     printb("Arming")
@@ -180,12 +187,15 @@ def takeoff():
     modeStartTime = time.time()
 
 def cleanup():
-    camera.release()
+    if not USE_VIDEO_FILE:
+        camera.stop()
+    else:
+        camera.release()
     cv2.destroyAllWindows() # close any open windows
     # Close vehicle object
-    if config.getboolean(configSection, 'connect'):
+    if DK_CONNECT:
         vehicle.close()
-        if config.getboolean(configSection, 'sitl'):
+        if USE_SITL:
             # Shut down simulator
             sitl.stop()
 
@@ -344,6 +354,11 @@ while not DK_CONNECT or vehicle.channels[START_CH_NUM] > 1700 or USE_SITL:
         # computer vision
         # if no new frame is available, continue
         if not processImage():
+            # returns false if no new frame is available. When reading from file
+            # this only happens when last frame is reached.
+            if USE_VIDEO_FILE and DK_CONNECT and USE_SITL:
+                print("Last video frame reached. Landing")
+                land()
             continue
 
         # modes that use the camera
@@ -389,6 +404,7 @@ while not DK_CONNECT or vehicle.channels[START_CH_NUM] > 1700 or USE_SITL:
     else: # only process images, presumably from file
         # if end of file reached
         if not processImage():
+            printb("Last video frame reached. Exiting")
             break
 
 cleanup()
