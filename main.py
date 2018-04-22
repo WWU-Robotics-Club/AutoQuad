@@ -4,6 +4,8 @@ import cv2
 import time
 import sys
 import math
+import socket
+import exceptions
 from pancv import PanCV
 try:
     from pivideostream import PiVideoStream
@@ -46,6 +48,7 @@ GPS_GLOBAL = 5 # fly to target using global coordinates
 ABORT = 6 # 
 MANUAL = 7 # don't try to control quadcopter
 mode = MANUAL
+running = True
 
 # other globals
 homeLocal = None # dronekit.LocationLocal of start location. Should be close to (0,0,0)
@@ -113,11 +116,17 @@ def initDronekit():
     # Bad TCP connection
     except socket.error:
         print 'Dronekit exception: No server exists!'
+        return False
     # Bad TTY connection
     except exceptions.OSError as e:
         print 'Dronekit exception: No serial exists!'
+        return False
+    except dronekit.APIException:
+        print 'Dronekit api exception: timeout'
+        return False
     except :
         print 'Dronekit exception while connecting.'
+        return False
     # set up updates for attitude
     def mode_callback(self, attrName, attrValue):
         global mode
@@ -139,13 +148,14 @@ def initDronekit():
         vehicle.commands.upload()
         printb("Enabled precision landing. Please reboot.")
         time.sleep(2)
-        sys.exit()
+        return False
     # print vehicle info
     print("Vehicle status:")
     print(" GPS: %s" % vehicle.gps_0)
     print(" Battery: %s" % vehicle.battery)
     print(" System status: %s" % vehicle.system_status.state)
     print(" Mode: %s" % vehicle.mode.name)
+    return True
 
 def takeoff():
     global mode
@@ -163,6 +173,7 @@ def takeoff():
         sys.stdout.write(str(vehicle.channels[START_CH_NUM]) + '\r')
         sys.stdout.flush()
         time.sleep(1)
+    printb('\r')
     printb("Received start signal")
     printb("Waiting for gps fix. Current fix type, satelites: ")
     while vehicle.gps_0.fix_type != 3:
@@ -170,6 +181,7 @@ def takeoff():
             + str(vehicle.gps_0.satellites_visible) + '\r')
         sys.stdout.flush()
         time.sleep(1)
+    printb('\r')
     printb("Changing mode to guided")
     vehicle.mode = dronekit.VehicleMode("GUIDED")
     printb("Arming")
@@ -303,11 +315,13 @@ def land():
 initCamera()
 initCV()
 if DK_CONNECT:
-    initDronekit()
-    takeoff()
-    
-# main loop
-while not DK_CONNECT or vehicle.channels[START_CH_NUM] > 1700 or USE_SITL:
+    if initDronekit():
+        takeoff()
+    else:
+        running = False
+# main loop. Run if dronekit isn't being used (images only),
+# or if dronekit is being used check if switch on radio is enabled, unless running from simulator.
+while running and (not DK_CONNECT or (DK_CONNECT and (vehicle.channels[START_CH_NUM] > 1700 or USE_SITL))):
     key = cv2.waitKey(1) & 0xFF 
     # if the 'q' key is pressed, stop the loop
     if key == ord("q"):
