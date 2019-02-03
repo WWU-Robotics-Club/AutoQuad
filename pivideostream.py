@@ -10,6 +10,7 @@ class PiVideoStream:
     def __init__(self, resolution=(320, 240), framerate=32):
         # initialize the camera and stream
         self.camera = PiCamera()
+        self._thread = None
         self.camera.resolution = resolution
         self.camera.framerate = framerate
         self.rawCapture = PiRGBArray(self.camera, size=resolution)
@@ -25,7 +26,8 @@ class PiVideoStream:
         
     def start(self):
         # start the thread to read frames from the video stream
-        Thread(target=self.update, args=()).start()
+        self._thread = Thread(target=self.update, args=())
+        self._thread.start()
         return self
  
     def update(self):
@@ -50,5 +52,6 @@ class PiVideoStream:
         return self.frame
  
     def stop(self):
-        # indicate that the thread should be stopped
+        # stop the camera thread and wait for it to finish executing
         self.stopped = True
+        self._thread.join()

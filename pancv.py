@@ -82,8 +82,7 @@ class PanCV:
         #mask = cv2.erode(mask, None, iterations=1)
         #mask = cv2.dilate(mask, None, iterations=1)
 
-        # find contours in the mask and initialize the current
-        # (x, y) center of the ball
+        # find contours in the mask
         (_, contours, hierarchy) = cv2.findContours(mask.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(frame, contours, -1, (255, 0, 0), 3)
         self.checkContours(contours, hierarchy, currentPoint)
@@ -105,52 +104,78 @@ class PanCV:
         self.lastFrame = frame
         self.lastMask = mask
         return
+    # Calculates contour statistics
     def checkContours(self, contours, hierarchy, point):
-        # hierarchy is array of arrays containing indexes of contours: [[Next, Previous, First_Child, Parent]]
+        # hierarchy is array of arrays containing indexes of contours: [[[Next, Previous, First_Child, Parent], [Next, ...]]]
         # all within an array. So hierarchy[0][0] corresponds to contours[0], h[0][1] to c[1], and so on
-        # loop through outer contours
+        # a value of -1 means it doesn't exist
+        
+        # if no contours were found
+        try:
+            if hierarchy is None or len(hierarchy) == 0 or len(hierarchy[0]) == 0:
+                point.confidence = 0;
+                return;
+        except:
+            print("Invalid hierarchy passed to checkContours")
+            point.confidence = 0;
+            return
         largest = None
         largestArea = 0
-        numChildren = None
-        # Search for largest contour
-        for i in range(len(hierarchy[0])):
-            if hierarchy[0][i][3] == -1: # Parent is -1 when is the contour is the outermost
-                area = cv2.contourArea(contours[i])
-                if area > largestArea:
-                    largestArea = area
-                    largest = i
-                    # count number of children. Aka number of rings
-                    numChildren = self.countChildren(hierarchy, i)
-                        
-        if largest != None: # if contour was found
-            ((x, y), radius) = cv2.minEnclosingCircle(contours[largest])
-            moments = cv2.moments(contours[largest])
-            if moments["m00"] != 0:
-                point.imgPoint = (int(moments["m10"] / moments["m00"]), int(moments["m01"] / moments["m00"]))
-                point.imgCentroid = (int(x),int(y))
-                point.radius = radius
-                # 1 when 3 children. 0.5 when no children
-                point.confidence = 1 - 0.5*(1 - numChildren/3)
+        numChildren = 0
+        # Find largest contour. Go through first hierarchy level
+        i = 0
+        while True:
+            area = cv2.contourArea(contours[i])
+            if area > largestArea:
+                largestArea = area
+                largest = i
+                # count number of children. Aka number of rings
+                numChildren = self.countLevels(hierarchy, i)
+            # if no next sibling
+            if hierarchy[0][i][0] == -1:
+                break
             else:
-                point.confidence = 0
-            point.children = numChildren
+                i = hierarchy[0][i][0]
+        # generate stats
+        if largest is None:
+            point.confidence = 0
+            return
+        ((x, y), radius) = cv2.minEnclosingCircle(contours[largest])
+        moments = cv2.moments(contours[largest])
+        if moments["m00"] != 0:
+            point.imgPoint = (int(moments["m10"] / moments["m00"]), int(moments["m01"] / moments["m00"]))
+            point.imgCentroid = (int(x),int(y))
+            point.radius = radius
+            # 1 when 3 children. 0.5 when no children
+            point.confidence = 1 - 0.5*(1 - numChildren/3)
         else:
             point.confidence = 0
+        point.children = numChildren
 
         
-    # returns longest chain of descendants of contour hierarchy
+    # returns the number of levels below a contour
     # https://docs.opencv.org/trunk/d9/d8b/tutorial_py_contours_hierarchy.html
-    def countChildren(self, hierarchy, index):
-        siblingChildren = 0
-        children = 0
-        # add sibling and siblings children/siblings
-        if hierarchy[0][index][0] != -1:
-            siblingChildren = self.countChildren(hierarchy, hierarchy[0][index][0])
-        # add child and child's children/siblings
-        if hierarchy[0][index][2] != -1:
-            children += 1
-            children += self.countChildren(hierarchy, hierarchy[0][index][2])
-        return children if children > siblingChildren else siblingChildren
+    # see checkContours comments for more details
+    def countLevels(self, hierarchy, index):
+        # if no first_child
+        if hierarchy[0][index][2] == -1:
+            return 0
+        levels = 1 # count the first_child's level
+        subLevels = 0 # levels below first_child or its siblings
+        
+        # for each contour on this level, count children
+        i = hierarchy[0][index][2] # first_child
+        while True:
+            # count number of sub levels
+            tmpLevels = self.countLevels(hierarchy, i);
+            if tmpLevels > subLevels:
+                subLevels = tmpLevels
+            # if no next sibling
+            if hierarchy[0][i][0] == -1:
+                break
+            else:
+                i = hierarchy[0][i][0] # next
+        return 1 + subLevels
     def setCoords(self, point): # calculate relative coordinates given a "point"
         # See Point class. Given self.cameraFOV, self.frameWidth,
         # x pixels (point.imgPoint[0]), y pixels (point.imgPoint[1]) and radius (point.radius),

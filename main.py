@@ -37,8 +37,11 @@ DK_CONNECT = config.getboolean(configSection, 'connect')
 PRINT_TO_MAVLINK = config.getboolean(configSection, 'printToMavlink')
 MAX_FLIGHT_TIME = config.getfloat(configSection, 'maxFlightTime')
 MAX_MODE_TIME = config.getfloat(configSection, 'maxModeTime')
+MANUAL_FLIGHT_MODE = config.get(configSection,'manualFlightMode')
 GEOFENCE_RAD = config.getfloat(configSection, 'geofenceRadius')
 USE_VIDEO_FILE = False if config.get(configSection,'video') == '' else True
+if USE_VIDEO_FILE:
+    USE_PI_CAMERA = False;
 # Main loop modes
 TAKEOFF = 1 # take off
 GPS_LOCAL = 2 # fly to target using position relative to start
@@ -47,7 +50,7 @@ LAND_NORM = 4 # normal landing
 GPS_GLOBAL = 5 # fly to target using global coordinates
 ABORT = 6 # 
 MANUAL = 7 # don't try to control quadcopter
-mode = MANUAL
+mode = MANUAL # current run mode
 running = True
 
 # other globals
@@ -87,15 +90,14 @@ def initCamera():
         camera = cv2.VideoCapture(config.get(configSection,'video'))
         print("Using video file")
     # if a video path was not supplied, grab the reference to the webcam or pi camera
+    elif USE_PI_CAMERA:
+        camera = PiVideoStream(resolution=(config.getint(configSection,'horizontalRes'),
+            config.getint(configSection,'verticalRes')), framerate=FRAMERATE)
+        camera.start()
+        print("Using pi camera")
     else:
-        if USE_PI_CAMERA:
-            camera = PiVideoStream(resolution=(config.getint(configSection,'horizontalRes'),
-                config.getint(configSection,'verticalRes')), framerate=FRAMERATE)
-            camera.start()
-            print("Using pi camera")
-        else:
-            camera = cv2.VideoCapture(0)
-            printb("Using webcam")
+        camera = cv2.VideoCapture(0)
+        printb("Using webcam")
 
 # set up dronekit
 def initDronekit():
@@ -199,10 +201,12 @@ def takeoff():
     modeStartTime = time.time()
 
 def cleanup():
+    printb("Starting cleanup. Stopping camera");
     if not USE_VIDEO_FILE:
-        camera.stop()
+        camera.stop() # wait for pivideostream thread or camera stream to stop
     else:
         camera.release()
+    printb("Stopped camera");
     cv2.destroyAllWindows() # close any open windows
     # Close vehicle object
     if DK_CONNECT:
@@ -210,6 +214,7 @@ def cleanup():
         if USE_SITL:
             # Shut down simulator
             sitl.stop()
+    printb("Finished cleanup")
 
 # http://python.dronekit.io/examples/guided-set-speed-yaw-demo.html
 # NED relative to homeLocal
@@ -281,7 +286,7 @@ def getDistance(aLocation1, aLocation2):
 # get and process image. Returns true if new image was processed,
 # False is no new image was available
 def processImage():
-    if USE_PI_CAMERA and not USE_VIDEO_FILE:
+    if USE_PI_CAMERA:
         # if a new frame has been read from camera
         if camera.framesElapsed > 0: 
             frame = camera.read()
@@ -314,41 +319,68 @@ def land():
 
 initCamera()
 initCV()
+
 if DK_CONNECT:
     if initDronekit():
         takeoff()
     else:
         running = False
-# main loop. Run if dronekit isn't being used (images only),
-# or if dronekit is being used check if switch on radio is enabled, unless running from simulator.
-while running and (not DK_CONNECT or (DK_CONNECT and (vehicle.channels[START_CH_NUM] > 1700 or USE_SITL))):
+        printb("initDronekit returned false. Exiting.")
+# if flying for real
+if (DK_CONNECT and not USE_SITL):
+    # wait for start signal
+    printb("Waiting for start signal...")
+    while vehicle.channels[START_CH_NUM] < 1700:
+        time.sleep(0.5)
+    printb("Got start signal. Starting main loop")
+else: # if images only or using SITL
+    printb("Starting main loop")
+
+# main loop. Run while running flag is set and start switch is on
+while running:
     key = cv2.waitKey(1) & 0xFF 
     # if the 'q' key is pressed, stop the loop
     if key == ord("q"):
+        printb("q pressed. Exiting")
         break
-    if DK_CONNECT:
-        # safety and exit condition checks
+    if DK_CONNECT: # if flying the drone (simulated or real)
+        # Safety and exit condition checks
         if not vehicle.armed:
             printb("Vehicle disarmed. Exiting.")
             break
-        if (getDistance(vehicle.location.global_frame, targetCoords) > GEOFENCE_RAD
-            and mode != GPS_GLOBAL and not USE_SITL):
-            # maybe use GPS GLOBAL instead
-            printb("Outside geofence. Switching to GPS_GLOBAL")
-            mode = GPS_GLOBAL
-            vehicle.simple_goto(targetCoords)
-            modeStartTime = time.time()
-            panCv.scaleRes(1)
+        if mode == MANUAL:
+            # if control is reenabled switch to GPS_GLOBAL mode
+            if not USE_SITL and vehicle.channels[START_CH_NUM] >= 1700:
+                mode = GPS_GLOBAL
+                vehicle.simple_goto(targetCoords)
+                modeStartTime = time.time()
+                #flightStartTime = time.time() # maybe?
+        else:
+            if (getDistance(vehicle.location.global_frame, targetCoords) > GEOFENCE_RAD
+                and mode != GPS_GLOBAL and not USE_SITL):
+                # maybe use GPS GLOBAL instead
+                printb("Outside geofence. Switching to GPS_GLOBAL")
+                mode = GPS_GLOBAL
+                vehicle.simple_goto(targetCoords)
+                modeStartTime = time.time()
+                panCv.scaleRes(1)
+            # if flying for real and start signal turns off
+            if not USE_SITL and vehicle.channels[START_CH_NUM] < 1700:
+                printb("Start signal turned off. Switching to manual control, flight mode "
+                    + MANUAL_FLIGHT_MODE)
+                mode = MANUAL
+                vehicle.mode = dronekit.VehicleMode(MANUAL_FLIGHT_MODE)
+                continue;
+            if ((time.time() - modeStartTime > MAX_MODE_TIME
+                or time.time() - flightStartTime > MAX_FLIGHT_TIME) and mode != ABORT):
+                abort()
+                printb("Max mode or flight time exceeded. Aborting.")
+                continue
             
         # modes that don't use camera
         if mode == ABORT:
             # just fly up to safe altitude. Handled by abort()
             time.sleep(0.2)
-            continue
-        if ((time.time() - modeStartTime > MAX_MODE_TIME
-            or time.time() - flightStartTime > MAX_FLIGHT_TIME) and mode != ABORT):
-            abort()
-            printb("Max mode or flight time exceeded. Aborting.")
             continue
         if mode == TAKEOFF:
             if vehicle.location.global_relative_frame.alt < TAKEOFF_ALT*0.9:
@@ -370,9 +402,13 @@ while running and (not DK_CONNECT or (DK_CONNECT and (vehicle.channels[START_CH_
         if not processImage():
             # returns false if no new frame is available. When reading from file
             # this only happens when last frame is reached.
-            if USE_VIDEO_FILE and DK_CONNECT and USE_SITL:
-                print("Last video frame reached. Landing")
-                land()
+            if USE_VIDEO_FILE:
+                if USE_SITL:
+                    printb("Last video frame reached. Landing")
+                    land()
+                else:
+                    running = False
+                    printb("Last video frame reached. Exiting")
             continue
 
         # modes that use the camera
@@ -405,7 +441,8 @@ while running and (not DK_CONNECT or (DK_CONNECT and (vehicle.channels[START_CH_
                 elif lastAcceptableP == -1 or lastAccAge > 1.5:
                     # retry up to 3 times
                     if landGuidedAttempts < 3:
-                        printb("Lost target. Switching to GPS_LOCAL. Bad frames: " + str(lastAcceptableP) + ", last good frame age: " + str(lastAccAge))
+                        printb("Lost target. Switching to GPS_LOCAL. Bad frames: "
+                            + str(lastAcceptableP) + ", last good frame age: " + str(lastAccAge))
                         mode = GPS_LOCAL
                         modeStartTime = time.time()
                         landGuidedAttempts += 1
@@ -415,10 +452,7 @@ while running and (not DK_CONNECT or (DK_CONNECT and (vehicle.channels[START_CH_
                         printb("Lost target 3rd time. Landing.")
                         land()
 
-    else: # only process images, presumably from file
-        # if end of file reached
-        if not processImage():
-            printb("Last video frame reached. Exiting")
-            break
+    else: # only process images
+        processImage()
 
 cleanup()
