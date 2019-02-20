@@ -2,6 +2,7 @@ import argparse
 import configparser
 import cv2
 import time
+import signal
 import sys
 import math
 import socket
@@ -28,6 +29,7 @@ config.read('config.ini')
 configSection = args.config
 FRAMERATE = config.getint(configSection,'framerate')
 DISPLAY = config.getboolean(configSection, 'display')
+DEBUG_LEVEL = config.getint(configSection,'debugLevel')
 TAKEOFF_ALT = config.getint(configSection,'takeoffAlt')
 targetCoords = dronekit.LocationGlobalRelative(config.getfloat(configSection, 'targetLat'),
     config.getfloat(configSection, 'targetLon'), TAKEOFF_ALT)
@@ -39,19 +41,27 @@ MAX_FLIGHT_TIME = config.getfloat(configSection, 'maxFlightTime')
 MAX_MODE_TIME = config.getfloat(configSection, 'maxModeTime')
 MANUAL_FLIGHT_MODE = config.get(configSection,'manualFlightMode')
 GEOFENCE_RAD = config.getfloat(configSection, 'geofenceRadius')
+ENABLE_GEOFENCE = config.getboolean(configSection, 'enableGeofence')
+THREADED = config.getboolean(configSection, 'threaded')
 USE_VIDEO_FILE = False if config.get(configSection,'video') == '' else True
 if USE_VIDEO_FILE:
     USE_PI_CAMERA = False;
+MODE_OVERRIDE_ENABLED = config.getboolean(configSection, 'modeOverrideEnabled')
+LAND_AFTER_MODE = config.getint(configSection,'landAfterMode')
+RELEASE_AFTER_MODE = config.getint(configSection,'releaseAfterMode')
 # Main loop modes
-TAKEOFF = 1 # take off
+STARTING = 0 # on ground
+TAKEOFF = 1 # take off, climbing to alt
 GPS_LOCAL = 2 # fly to target using position relative to start
 LAND_GUIDED = 3 # use precision landing
 LAND_NORM = 4 # normal landing
 GPS_GLOBAL = 5 # fly to target using global coordinates
-ABORT = 6 # 
+ABORT = 6 # fly up and hover
 MANUAL = 7 # don't try to control quadcopter
 mode = MANUAL # current run mode
 running = True
+# did pilot or software switch to manual mode
+softwareRelease = False
 
 # other globals
 homeLocal = None # dronekit.LocationLocal of start location. Should be close to (0,0,0)
@@ -67,6 +77,21 @@ flightStartTime = None
 modeStartTime = None
 lastMsgTime = 0.0 # for keeping track of how often messages are sent
 landGuidedAttempts = 0
+
+# set up ctrl+c handler
+def signal_handler(sig, frame):
+    global running
+    if running:
+        printb('Ctrl+C pressed. Stopping loop.')
+        running = False
+    else:
+        print('Ctrl+C pressed twice. Hard stopping.')
+        try:
+            cleanup()
+        except:
+            pass
+        sys.exit(0)
+signal.signal(signal.SIGINT, signal_handler)
 
 # set up image recognition
 def initCV(): 
@@ -92,7 +117,7 @@ def initCamera():
     # if a video path was not supplied, grab the reference to the webcam or pi camera
     elif USE_PI_CAMERA:
         camera = PiVideoStream(resolution=(config.getint(configSection,'horizontalRes'),
-            config.getint(configSection,'verticalRes')), framerate=FRAMERATE)
+            config.getint(configSection,'verticalRes')), framerate=FRAMERATE, threaded=THREADED)
         camera.start()
         print("Using pi camera")
     else:
@@ -117,36 +142,35 @@ def initDronekit():
         vehicle = dronekit.connect(connectionString, wait_ready=True, baud=config.getfloat(configSection,'baud'))
     # Bad TCP connection
     except socket.error:
-        print 'Dronekit exception: No server exists!'
+        printb('Dronekit exception: No server exists!')
         return False
     # Bad TTY connection
     except exceptions.OSError as e:
-        print 'Dronekit exception: No serial exists!'
+        printb('Dronekit exception: No serial exists!')
         return False
     except dronekit.APIException:
-        print 'Dronekit api exception: timeout'
+        printb('Dronekit api exception: timeout')
         return False
     except :
-        print 'Dronekit exception while connecting.'
+        printb('Dronekit exception while connecting.')
         return False
     # set up updates for attitude
     def mode_callback(self, attrName, attrValue):
         global mode
         modeName = attrValue.name
         printb("Vehicle Mode changed to " + modeName)
-        printb(attrValue)
         if modeName == "LAND" and mode != LAND_NORM:
             mode = LAND_NORM
         elif modeName != "GUIDED" and modeName != "LAND":
             mode = MANUAL
-            printb("Mode switched away from guided. Ceasing control.")
+            printb("Mode switched away from guided by pilot. Ceasing control.")
     #Add observer callback for attribute mode
     vehicle.add_attribute_listener('mode', mode_callback)
 
     # set up vehicle
     if not USE_SITL and (vehicle.parameters['PLND_ENABLED'] != 1 or vehicle.parameters['PLND_TYPE'] != 1):
-        vehicle.parameters['PLND_ENABLED'] == 1
-        vehicle.parameters['PLND_TYPE'] == 1
+        vehicle.parameters['PLND_ENABLED'] = 1
+        vehicle.parameters['PLND_TYPE'] = 1
         vehicle.commands.upload()
         printb("Enabled precision landing. Please reboot.")
         time.sleep(2)
@@ -164,21 +188,24 @@ def takeoff():
     global homeLocal
     global modeStartTime
     global flightStartTime
+    mode = STARTING
     printb("Waiting for vehicle armable.")
     while not vehicle.is_armable:
         time.sleep(1)
     printb("Vehicle is armable.")
     
     # fly vehicle
-    printb("Waiting for start signal. Current level: ")
-    while vehicle.channels[START_CH_NUM] < 1700 and not USE_SITL:
-        sys.stdout.write(str(vehicle.channels[START_CH_NUM]) + '\r')
-        sys.stdout.flush()
-        time.sleep(1)
-    printb('\r')
-    printb("Received start signal")
+    # if flying for real
+    if (DK_CONNECT and not USE_SITL):
+        printb("Waiting for start signal. Current level: ")
+        while vehicle.channels[START_CH_NUM] < 1700 and not USE_SITL:
+            sys.stdout.write(str(vehicle.channels[START_CH_NUM]) + '\r')
+            sys.stdout.flush()
+            time.sleep(1)
+        printb('\r')
+        printb("Received start signal")
     printb("Waiting for gps fix. Current fix type, satelites: ")
-    while vehicle.gps_0.fix_type != 3:
+    while vehicle.gps_0.fix_type < 3:
         sys.stdout.write(str(vehicle.gps_0.fix_type) + ","
             + str(vehicle.gps_0.satellites_visible) + '\r')
         sys.stdout.flush()
@@ -210,11 +237,13 @@ def cleanup():
     cv2.destroyAllWindows() # close any open windows
     # Close vehicle object
     if DK_CONNECT:
-        vehicle.close()
+        if vehicle is not None:
+            vehicle.close()
         if USE_SITL:
             # Shut down simulator
             sitl.stop()
     printb("Finished cleanup")
+    sys.exit(0)
 
 # http://python.dronekit.io/examples/guided-set-speed-yaw-demo.html
 # NED relative to homeLocal
@@ -241,8 +270,8 @@ def gotoLocal(locationLocal):
 # see http://mavlink.org/messages/common#LANDING_TARGET
 # https://github.com/mavlink/mavlink/blob/master/message_definitions/v1.0/common.xml#L4078
 def sendLandMsg(point):
-    #print("landMsg" + str(point.angleX) + " " + str(point.angleY)
-    #+ " " + str(point.distance) + " " + str(point.radians))
+    printb("landMsg" + str(point.angleX) + " " + str(point.angleY)
+    + " " + str(point.distance) + " " + str(point.radians), 5)
     msg = vehicle.message_factory.landing_target_encode(
         0, # time_boot_ms (not used)
         0, # target num
@@ -254,10 +283,12 @@ def sendLandMsg(point):
         point.radians) # size of target in radians
     vehicle.send_mavlink(msg)
     vehicle.commands.upload()
-def printb(msg):
-    print(msg)
-    if PRINT_TO_MAVLINK:
-        printMavlink(msg)
+# print if level is <= to debugLevel. 1 is highest, 2,3 are lower
+def printb(msg, level=1):
+    if level <= DEBUG_LEVEL and level > 0:
+        print(msg)
+        if PRINT_TO_MAVLINK:
+            printMavlink(msg)
     
 def printMavlink(msg): # this doesn't work
     # https://github.com/dronekit/dronekit-python/issues/270
@@ -290,6 +321,7 @@ def processImage():
         # if a new frame has been read from camera
         if camera.framesElapsed > 0: 
             frame = camera.read()
+            printb("Read frame",3)
         else:
             return False
     else:
@@ -300,8 +332,13 @@ def processImage():
         if USE_VIDEO_FILE and not grabbed:
             return False
     panCv.detect(frame)
+    printb("Processed frame",3)
     if DISPLAY:
-        panCv.display()
+        try:
+            panCv.display()
+            printb("Displayed frame",3)
+        except:
+            printb("Couldn't display frame")
     return True
 def abort():
     global mode
@@ -309,13 +346,24 @@ def abort():
     vehicle.simple_goto(targetCoords)
     mode = ABORT
     modeStartTime = time.time()
+    printb("Aborted.")
 def land():
     global mode
     global modeStartTime
     mode = LAND_NORM
     modeStartTime = time.time()
     vehicle.mode = dronekit.VehicleMode("LAND")
-    vehicle.commands.upload() 
+    vehicle.commands.upload()
+def releaseControl(softwareReleaseFlag):
+    global mode
+    global modeStartTime
+    global softwareRelease
+    softwareRelease = softwareReleaseFlag
+    mode = MANUAL
+    modeStartTime = time.time()
+    vehicle.mode = dronekit.VehicleMode(MANUAL_FLIGHT_MODE)
+    vehicle.commands.upload()
+
 
 initCamera()
 initCV()
@@ -326,20 +374,13 @@ if DK_CONNECT:
     else:
         running = False
         printb("initDronekit returned false. Exiting.")
-# if flying for real
-if (DK_CONNECT and not USE_SITL):
-    # wait for start signal
-    printb("Waiting for start signal...")
-    while vehicle.channels[START_CH_NUM] < 1700:
-        time.sleep(0.5)
-    printb("Got start signal. Starting main loop")
-else: # if images only or using SITL
-    printb("Starting main loop")
+        cleanup()
 
+printb("Starting main loop")
 # main loop. Run while running flag is set and start switch is on
 while running:
     key = cv2.waitKey(1) & 0xFF 
-    # if the 'q' key is pressed, stop the loop
+    # if the 'q' key is pressed, stop the loop. Only works when DISPLAY=True
     if key == ord("q"):
         printb("q pressed. Exiting")
         break
@@ -349,14 +390,18 @@ while running:
             printb("Vehicle disarmed. Exiting.")
             break
         if mode == MANUAL:
-            # if control is reenabled switch to GPS_GLOBAL mode
-            if not USE_SITL and vehicle.channels[START_CH_NUM] >= 1700:
+            # if control is reenabled switch to GPS_GLOBAL mode and the program wasn't the one to release it
+            if not USE_SITL and vehicle.channels[START_CH_NUM] >= 1700 and not softwareRelease:
                 mode = GPS_GLOBAL
                 vehicle.simple_goto(targetCoords)
                 modeStartTime = time.time()
+                printb("Control re-enabled. Resuming GPS_GLOBAL control.")
                 #flightStartTime = time.time() # maybe?
+            # if softwareRelease is set, pilot should re-give control
+            elif not USE_SITL and vehicle.channels[START_CH_NUM] < 1700:
+                softwareRelease = False
         else:
-            if (getDistance(vehicle.location.global_frame, targetCoords) > GEOFENCE_RAD
+            if ENABLE_GEOFENCE and (getDistance(vehicle.location.global_frame, targetCoords) > GEOFENCE_RAD
                 and mode != GPS_GLOBAL and not USE_SITL):
                 # maybe use GPS GLOBAL instead
                 printb("Outside geofence. Switching to GPS_GLOBAL")
@@ -368,14 +413,23 @@ while running:
             if not USE_SITL and vehicle.channels[START_CH_NUM] < 1700:
                 printb("Start signal turned off. Switching to manual control, flight mode "
                     + MANUAL_FLIGHT_MODE)
-                mode = MANUAL
-                vehicle.mode = dronekit.VehicleMode(MANUAL_FLIGHT_MODE)
+                releaseControl(False)
                 continue;
+            # if mode or flight is taking too long
             if ((time.time() - modeStartTime > MAX_MODE_TIME
-                or time.time() - flightStartTime > MAX_FLIGHT_TIME) and mode != ABORT):
+                or time.time() - flightStartTime > MAX_FLIGHT_TIME) and mode != ABORT and mode != MANUAL):
                 abort()
                 printb("Max mode or flight time exceeded. Aborting.")
                 continue
+            if (MODE_OVERRIDE_ENABLED):
+                if mode > LAND_AFTER_MODE:
+                    printb("Debug mode override. Landing.")
+                    land()
+                    continue
+                if mode > RELEASE_AFTER_MODE:
+                    printb("Debug mode override. Releasing control.")
+                    releaseControl(True)
+                    continue
             
         # modes that don't use camera
         if mode == ABORT:
@@ -453,6 +507,14 @@ while running:
                         land()
 
     else: # only process images
-        processImage()
+        if not processImage():
+            continue;
+        if len(panCv.points) < 1:
+            printb("No points",2)
+        elif panCv.points[0].confidence > 0:
+            printb("Confidence: " + str(panCv.points[0].confidence) + ", X: " + str(panCv.points[0].angleX)
+                + ", Y: " + str(panCv.points[0].angleY) + ", Dist: " + str(panCv.points[0].distance), 2)
+        else: # distance and angle are None if confidence == 0
+            printb("Confidence: 0", 2)
 
 cleanup()
