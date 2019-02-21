@@ -1,12 +1,5 @@
 # AutoQuad
 
-Windows installation:
-Install Python 3.6.3 from: https://www.python.org/downloads/
-Be sure to have it install pip.
-From admin cmd prompt type: 
-pip install opencv-contrib-python
-pip install numpy
-pip install imutils
+An autonomous quadcopter that uses computer vision, a raspberry pi computer, and a Pixhawk autopilot.
 
-
-Style guide: https://www.python.org/dev/peps/pep-0008/
+See the wiki for some instructions: https://github.com/WWU-Robotics-Club/AutoQuad/wiki

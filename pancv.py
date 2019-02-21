@@ -1,17 +1,24 @@
+# https://www.pyimagesearch.com/2015/09/14/ball-tracking-with-opencv/
 from collections import deque
 import numpy as np
 import imutils
 import cv2
+import math
+import time
 
 class Point:
-    imgPoint = None
-    imgCentroid = None
-    radius = None
-    #time = None
-    #x = None
-    #y = None
-    #z = None
-    #confidence = None
+    imgPoint = None # (x,y) position of moment of detected shape
+    imgCentroid = None # (x,y) position of min enclosing circle
+    radius = None # radius of target in meters
+    radians = None # width of target in radians
+    distance = None # triangulated distance from camera
+    children = None # number of contours found within outer contour
+    time = None # time point was processed
+    angleX = None # radians from center of image
+    angleY = None
+    confidence = None # 0 to 1
+    def age(self):
+        return time.time() - self.time
 class PanCV:
     camera = None
 
@@ -20,62 +27,165 @@ class PanCV:
     # list of tracked points
     colorLower = None
     colorUpper = None
-    targetRadius = None # For calculating distance
-    frameWidth = 600 # width in pixels to resize frame to
-    cameraFOV = None # Degrees? Radians?
-    historySize = 50
+    targetRadius = None # meters. For calculating distance
+    horizontalRes = None # width in pixels to resize frame to
+    verticalRes = None # height of frame after resizing
+    cameraFOV = None # radians
+    historySize = None
     points = deque(maxlen=historySize)
     lastFrame = None
     lastMask = None
+    idealRadius = 50 # used when scaling
+    # private
+    _hResScaled = None
+    _vResScaled = None
+    _resScalar = None # scale resolution. Use lower when closer to get higher framerate
+    def scaleRes(self, scale, add = False):
+        if add:
+            scale = scale + self._resScalar
+        if scale > 1:
+            scale = 1
+        elif scale < 0.1:
+            scale = 0.1
+        self._resScalar = scale
+        self._hResScaled = int(self.horizontalRes*scale)
+        self._vResScaled = int(self.verticalRes*scale)
+    # returns index of last 1 confidence point. -1 if none have 1 confidence
+    def lastGoodPoint(self, threshold):
+        i = 0
+        lq = len(self.points)
+        while i < lq and self.points[i].confidence < threshold:
+            i += 1
+        if self.points[i].confidence == 1:
+            return i
+        else:
+            return -1
     def resetHistorySize(self, size):
         self.historySize = size
-        points = deque(maxlen=historySize)
+        self.points = deque(maxlen = size)
     def detect(self, frame):
         currentPoint = Point()
-     
+        currentPoint.time = time.time()
         # resize the frame, blur it, and convert it to the HSV
         # color space
-        frame = imutils.resize(frame, width=self.frameWidth)
+        frame = imutils.resize(frame, width=self._hResScaled)
         # blurred = cv2.GaussianBlur(frame, (11, 11), 0)
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
-        # construct a mask for the color "green", then perform
+        # construct a mask for the color, then perform
         # a series of dilations and erosions to remove any small
         # blobs left in the mask
-        mask = cv2.inRange(hsv, self.colorLower, self.colorUpper)
-        mask = cv2.erode(mask, None, iterations=2)
-        mask = cv2.dilate(mask, None, iterations=2)
+        mask1 = cv2.inRange(hsv, self.colorLower1, self.colorUpper1)
+        mask2 = cv2.inRange(hsv, self.colorLower2, self.colorUpper2)
+        mask = mask1 + mask2
+        
+        #mask = cv2.erode(mask, None, iterations=1)
+        #mask = cv2.dilate(mask, None, iterations=1)
+
+        # find contours in the mask
+        (_, contours, hierarchy) = cv2.findContours(mask.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(frame, contours, -1, (255, 0, 0), 3)
+        self.checkContours(contours, hierarchy, currentPoint)
+        if currentPoint.confidence > 0:
+            self.setCoords(currentPoint)
+            cv2.putText(frame, "Dist: " + str(currentPoint.distance)[:5], (5,15), 1, 1.0, (0,200,200), 1)
+            cv2.putText(frame, "Children: " + str(currentPoint.children)[:5], (5,30), 1, 1.0, (0,200,200), 1)
+            cv2.putText(frame, "Confidence: " + str(currentPoint.confidence)[:5], (5,45), 1, 1.0, (0,200,200), 1)
+            cv2.putText(frame, "Pix radius: " + str(currentPoint.radius)[:5], (5,60), 1, 1.0, (0,200,200), 1)
+
+        # change scale
+        if currentPoint.confidence == 1:
+            self.scaleRes(self._resScalar * self.idealRadius / currentPoint.radius)
+        else: # increase scale slightly to hopefully get better result
+            self.scaleRes(0.02, True)
+        # update the points queue
+        self.points.appendleft(currentPoint)
         
         self.lastFrame = frame
         self.lastMask = mask
-        # find contours in the mask and initialize the current
-        # (x, y) center of the ball
-        cnts = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE)[-2]
-     
-        # only proceed if at least one contour was found
-        if len(cnts) > 0:
-            # find the largest contour in the mask, then use
-            # it to compute the minimum enclosing circle and
-            # centroid
-            c = max(cnts, key=cv2.contourArea)
-            ((x, y), radius) = cv2.minEnclosingCircle(c)
-            M = cv2.moments(c)
-            currentPoint.imgPoint = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
-            currentPoint.imgCentroid = (int(x),int(y))
-            currentPoint.radius = radius
-
-            #setCoords(currentPoint) # uncomment when setCoords is implemented
-            # update the points queue
-            self.points.appendleft(currentPoint)
-        else:
-            return False
+        return
+    # Calculates contour statistics
+    def checkContours(self, contours, hierarchy, point):
+        # hierarchy is array of arrays containing indexes of contours: [[[Next, Previous, First_Child, Parent], [Next, ...]]]
+        # all within an array. So hierarchy[0][0] corresponds to contours[0], h[0][1] to c[1], and so on
+        # a value of -1 means it doesn't exist
         
-        return True
+        # if no contours were found
+        try:
+            if hierarchy is None or len(hierarchy) == 0 or len(hierarchy[0]) == 0:
+                point.confidence = 0;
+                return;
+        except:
+            print("Invalid hierarchy passed to checkContours")
+            point.confidence = 0;
+            return
+        largest = None
+        largestArea = 0
+        numChildren = 0
+        # Find largest contour. Go through first hierarchy level
+        i = 0
+        while True:
+            area = cv2.contourArea(contours[i])
+            if area > largestArea:
+                largestArea = area
+                largest = i
+                # count number of children. Aka number of rings
+                numChildren = self.countLevels(hierarchy, i)
+            # if no next sibling
+            if hierarchy[0][i][0] == -1:
+                break
+            else:
+                i = hierarchy[0][i][0]
+        # generate stats
+        if largest is None:
+            point.confidence = 0
+            return
+        ((x, y), radius) = cv2.minEnclosingCircle(contours[largest])
+        moments = cv2.moments(contours[largest])
+        if moments["m00"] != 0:
+            point.imgPoint = (int(moments["m10"] / moments["m00"]), int(moments["m01"] / moments["m00"]))
+            point.imgCentroid = (int(x),int(y))
+            point.radius = radius
+            # 1 when 3 children. 0.5 when no children
+            point.confidence = 1 - 0.5*(1 - numChildren/3)
+        else:
+            point.confidence = 0
+        point.children = numChildren
+
+        
+    # returns the number of levels below a contour
+    # https://docs.opencv.org/trunk/d9/d8b/tutorial_py_contours_hierarchy.html
+    # see checkContours comments for more details
+    def countLevels(self, hierarchy, index):
+        # if no first_child
+        if hierarchy[0][index][2] == -1:
+            return 0
+        levels = 1 # count the first_child's level
+        subLevels = 0 # levels below first_child or its siblings
+        
+        # for each contour on this level, count children
+        i = hierarchy[0][index][2] # first_child
+        while True:
+            # count number of sub levels
+            tmpLevels = self.countLevels(hierarchy, i);
+            if tmpLevels > subLevels:
+                subLevels = tmpLevels
+            # if no next sibling
+            if hierarchy[0][i][0] == -1:
+                break
+            else:
+                i = hierarchy[0][i][0] # next
+        return 1 + subLevels
     def setCoords(self, point): # calculate relative coordinates given a "point"
         # See Point class. Given self.cameraFOV, self.frameWidth,
         # x pixels (point.imgPoint[0]), y pixels (point.imgPoint[1]) and radius (point.radius),
         # populate point's x, y, and z with distance from target
+        radPerPix = np.deg2rad(self.cameraFOV) / self._hResScaled
+        halfTargetAngle = point.radius * radPerPix
+        point.radians = 2 * halfTargetAngle
+        point.distance = self.targetRadius / math.tan(halfTargetAngle)
+        point.angleX = (point.imgCentroid[0] - self._hResScaled/2) * radPerPix
+        point.angleY = (point.imgCentroid[1] - self._vResScaled/2) * radPerPix
         return
     def display(self):
         # loop over the set of tracked points
@@ -88,9 +198,10 @@ class PanCV:
             # otherwise, compute the thickness of the line and
             # draw the connecting lines
             thickness = int(np.sqrt(self.historySize / float(i + 1)) * 2.5)
-            cv2.line(self.lastFrame, self.points[i - 1].imgPoint, self.points[i].imgPoint, (0, 0, 255), thickness)
+            cv2.line(self.lastFrame, self.points[i - 1].imgPoint, self.points[i].imgPoint,
+                (0, 0, 255), thickness)
         # only draw circle if the radius meets a minimum size
-        if len(self.points) > 0 and self.points[0].radius > 10:
+        if len(self.points) > 0 and self.points[0].confidence > 0 and self.points[0].radius > 10:
             # draw the circle and centroid on the frame,
             # then update the list of tracked points
             cv2.circle(self.lastFrame, self.points[0].imgPoint, int(self.points[0].radius),
@@ -98,3 +209,4 @@ class PanCV:
             cv2.circle(self.lastFrame, self.points[0].imgCentroid, 5, (0, 0, 255), -1)
         # show the frame to our screen
         cv2.imshow("Frame", self.lastFrame)
+        cv2.imshow("Mask", self.lastMask)
